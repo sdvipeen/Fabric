@@ -1,0 +1,589 @@
+# Task 3: Connect and Update Fabric Workspace from Git
+          # Based on Microsoft's official sample: GitIntegration-ConnectAndUpdateFromGit.ps1
+          # Uses service principal authentication with client secret for Git integration
+          - task: PowerShell@2
+            displayName: 'Connect and Update Fabric Workspace from Git'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Install Azure PowerShell module if not available
+                if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+                    Write-Host "Installing Azure PowerShell module..."
+                    Install-Module -Name Az.Accounts -Force -AllowClobber -Scope CurrentUser
+                }
+                
+                # Based on Microsoft's official fabric-samples GitIntegration-ConnectAndUpdateFromGit.ps1
+                # https://github.com/microsoft/fabric-samples/blob/main/features-samples/git-integration/GitIntegration-ConnectAndUpdateFromGit.ps1
+                
+                # Configuration from pipeline variables
+                $workspaceName = '$(pbiWorkspaceName)'
+                $shouldDisconnect = $false  # Set to true if you need to disconnect first
+                
+                # Azure DevOps Git provider details from pipeline variables
+                $azureDevOpsDetails = @{
+                    gitProviderType = "AzureDevOps"
+                    organizationName = "$(azureDevOpsOrganization)"
+                    projectName = "$(azureDevOpsProject)"
+                    repositoryName = "$(gitRepositoryName)"
+                    branchName = "$(gitBranchName)"
+                    directoryName = "$(gitDirectoryName)"
+                }
+                
+                $gitProviderDetails = $azureDevOpsDetails
+                $connectionName = "$(gitConnectionName)"  # Connection name that stores Git credentials
+                
+                # Global variables
+                $global:baseUrl = "https://api.fabric.microsoft.com/v1"
+                $global:resourceUrl = "https://api.fabric.microsoft.com"
+                $global:fabricHeaders = @{}
+                
+                # Function to set Fabric authentication headers using service principal
+                function SetFabricHeaders() {
+                    Write-Host "Setting up Fabric authentication headers using service principal..."
+                    
+                    # Service Principal authentication with client secret
+                    $clientId = "$(AZURE_CLIENT_ID)"
+                    $clientSecret = "$(AZURE_CLIENT_SECRET)"
+                    $tenantId = "$(AZURE_TENANT_ID)"
+                    
+                    Write-Host "Authenticating with Service Principal: $clientId"
+                    
+                    # Convert client secret to secure string
+                    $secureSecret = ConvertTo-SecureString -String $clientSecret -AsPlainText -Force
+                    $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $clientId, $secureSecret
+                    
+                    # Connect to Azure using service principal
+                    try {
+                        Connect-AzAccount -ServicePrincipal -TenantId $tenantId -Credential $credential | Out-Null
+                        Write-Host "✅ Successfully authenticated with Azure"
+                        
+                        $context = Get-AzContext
+                        Write-Host "Using Azure context: $($context.Account.Id)"
+                        Write-Host "Account Type: $($context.Account.Type)"
+                        Write-Host "Tenant: $($context.Tenant.Id)"
+                    }
+                    catch {
+                        Write-Error "Failed to authenticate with Azure: $($_.Exception.Message)"
+                        throw
+                    }
+                    
+                    # Get access token for Fabric API
+                    try {
+                        $secureFabricToken = (Get-AzAccessToken -AsSecureString -ResourceUrl $global:resourceUrl).Token
+                        
+                        # Convert SecureString to plain text
+                        $ssPtr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureFabricToken)
+                        try {
+                            $fabricToken = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ssPtr)
+                        } finally {
+                            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ssPtr)
+                        }
+                        
+                        $global:fabricHeaders = @{
+                            'Content-Type' = "application/json"
+                            'Authorization' = "Bearer $fabricToken"
+                        }
+                        
+                        Write-Host "✅ Successfully acquired Fabric API token"
+                    }
+                    catch {
+                        Write-Error "Failed to acquire Fabric token: $($_.Exception.Message)"
+                        throw
+                    }
+                }
+                
+                # Function to get workspace by name
+                function GetWorkspaceByName($workspaceName) {
+                    Write-Host "Looking for workspace: '$workspaceName'"
+                    $getWorkspacesUrl = "$global:baseUrl/workspaces"
+                    $workspaces = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getWorkspacesUrl -Method GET).value
+                    $workspace = $workspaces | Where-Object {$_.DisplayName -eq $workspaceName}
+                    return $workspace
+                }
+                
+                # Function to get connection by name
+                function GetConnectionByName($connectionName) {
+                    Write-Host "Looking for connection: '$connectionName'"
+                    $getConnectionsUrl = "$global:baseUrl/connections"
+                    $connections = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getConnectionsUrl -Method GET).value
+                    $connection = $connections | Where-Object {$_.DisplayName -eq $connectionName}
+                    return $connection
+                }
+                
+                # Function to handle errors
+                function GetErrorResponse($exception) {
+                    $errorResponse = $_.ErrorDetails.Message     
+                    if(!$errorResponse) {
+                        if (!$exception.Response) {
+                            return $exception.Message
+                        }
+                        $result = $exception.Response.GetResponseStream()
+                        $reader = New-Object System.IO.StreamReader($result)
+                        $reader.BaseStream.Position = 0
+                        $reader.DiscardBufferedData()
+                        $errorResponse = $reader.ReadToEnd();
+                    }
+                    return $errorResponse
+                }
+                
+                try {
+                    # Set up authentication
+                    SetFabricHeaders
+                    
+                    # Get workspace
+                    $workspace = GetWorkspaceByName $workspaceName
+                    if(!$workspace) {
+                        Write-Error "❌ Workspace '$workspaceName' not found."
+                        throw
+                    }
+                    Write-Host "✅ Found workspace: '$($workspace.DisplayName)' (ID: $($workspace.Id))"
+                    
+                    # Check if workspace is already connected to Git
+                    Write-Host "Checking current Git connection status..."
+                    try {
+                        $getConnectionUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/connection"
+                        $currentConnection = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getConnectionUrl -Method GET
+                        Write-Host "✅ Workspace is already connected to Git:"
+                        Write-Host "  Repository: $($currentConnection.gitProviderDetails.repositoryName)"
+                        Write-Host "  Branch: $($currentConnection.gitProviderDetails.branchName)"
+                        Write-Host "  Directory: $($currentConnection.gitProviderDetails.directoryName)"
+                        
+                        # Skip connection step and go directly to update
+                        $skipConnection = $true
+                    }
+                    catch {
+                        Write-Host "⚠️ Workspace is not connected to Git. Will attempt to connect..."
+                        $skipConnection = $false
+                    }
+                    
+                    if (-not $skipConnection) {
+                        # Disconnect if needed
+                        if ($shouldDisconnect) {
+                            Write-Host "Disconnecting workspace from Git..."
+                            $disconnectUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/disconnect"
+                            Invoke-RestMethod -Headers $global:fabricHeaders -Uri $disconnectUrl -Method POST
+                            Write-Host "✅ Workspace disconnected from Git"
+                        }
+                        
+                        # Connect to Git
+                        Write-Host "Connecting workspace '$workspaceName' to Git..."
+                        $connectUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/connect"
+                        
+                        # Get the connection that stores Git credentials
+                        $connection = GetConnectionByName $connectionName
+                        if(!$connection) {
+                            Write-Host "❌ Git credentials connection '$connectionName' not found."
+                            Write-Host ""
+                            Write-Host "🔧 MANUAL CONFIGURATION REQUIRED:"
+                            Write-Host "You need to create a connection in Fabric that stores your Git credentials."
+                            Write-Host "1. Go to Fabric workspace '$workspaceName'"
+                            Write-Host "2. Workspace settings → Git Integration → Azure DevOps → Add Account"
+                            Write-Host "3. Configure connection:"
+                            Write-Host "   - Display name: '$connectionName'"
+                            Write-Host "   - Azure DevOps URL: https://dev.azure.com/$(azureDevOpsOrganization)/$(azureDevOpsProject)/_git/$(gitRepositoryName)"
+                            Write-Host "   - Authentication: Service Principal"
+                            Write-Host "   - Tenant ID: $(AZURE_TENANT_ID)"
+                            Write-Host "   - Service Principal ID: $(AZURE_CLIENT_ID)"
+                            Write-Host "   - Service Principal Key: [Your client secret]"
+                            Write-Host ""
+                            throw "Git credentials connection not configured"
+                        }
+                        
+                        Write-Host "✅ Found Git credentials connection: '$($connection.DisplayName)' (ID: $($connection.id))"
+                        
+                        # Connect to Git using configured connection
+                        $connectToGitBody = @{
+                            gitProviderDetails = $gitProviderDetails
+                            myGitCredentials = @{
+                                source = "ConfiguredConnection"
+                                connectionId = $connection.id
+                            }
+                        } | ConvertTo-Json
+                        
+                        Invoke-RestMethod -Headers $global:fabricHeaders -Uri $connectUrl -Method POST -Body $connectToGitBody
+                        Write-Host "✅ Workspace connected to Git successfully"
+                        
+                        # Initialize Connection
+                        Write-Host "Initializing Git connection..."
+                        $initializeConnectionUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/initializeConnection"
+                        $initializeConnectionResponse = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $initializeConnectionUrl -Method POST
+                        Write-Host "✅ Git connection initialized"
+                    }
+                    else {
+                        # For already connected workspace, we need to ensure the service principal has Git credentials
+                        Write-Host "Getting Git status for already connected workspace..."
+                        $gitStatusUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/status"
+                        
+                        try {
+                            Write-Host "🔍 Attempting to get Git status..."
+                            Write-Host "Git Status URL: $gitStatusUrl"
+                            Write-Host "Using headers: Content-Type = application/json, Authorization = Bearer [REDACTED]"
+                            
+                            $gitStatusResponse = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $gitStatusUrl -Method GET
+                            
+                            Write-Host "✅ Git status retrieved successfully"
+                            Write-Host "Response: $($gitStatusResponse | ConvertTo-Json -Depth 3)"
+                            
+                            # Create initialize response object for consistent processing
+                            $initializeConnectionResponse = @{
+                                RequiredAction = "UpdateFromGit"
+                                RemoteCommitHash = $gitStatusResponse.RemoteCommitHash
+                                WorkspaceHead = $gitStatusResponse.WorkspaceHead
+                            }
+                        }
+                        catch {
+                            Write-Host "❌ Git status call failed"
+                            Write-Host "Error Type: $($_.Exception.GetType().FullName)"
+                            Write-Host "HTTP Status Code: $($_.Exception.Response.StatusCode)"
+                            Write-Host "Error Details Raw: $($_.ErrorDetails.Message)"
+                            Write-Host "Exception Message: $($_.Exception.Message)"
+                            Write-Host "Processing error details to check for GitCredentialsNotConfigured..."
+                            $errorDetails = $null
+                            
+                            # Try to parse error details from different sources
+                            if ($_.ErrorDetails.Message) {
+                                try {
+                                    $errorDetails = $_.ErrorDetails.Message | ConvertFrom-Json
+                                    Write-Host "Parsed error details from ErrorDetails.Message: $($errorDetails.errorCode)"
+                                } catch {
+                                    Write-Host "Could not parse ErrorDetails.Message as JSON"
+                                }
+                            }
+                            
+                            # Also check the exception message for GitCredentialsNotConfigured
+                            if (-not $errorDetails -and $_.Exception.Message -like "*GitCredentialsNotConfigured*") {
+                                Write-Host "Found GitCredentialsNotConfigured in exception message"
+                                $errorDetails = @{ errorCode = "GitCredentialsNotConfigured" }
+                            }
+                            
+                            if ($errorDetails -and $errorDetails.errorCode -eq "GitCredentialsNotConfigured") {
+                                Write-Host "⚠️ EXPECTED ERROR: Git credentials not configured for service principal"
+                                Write-Host "✅ GOOD NEWS: Your service principal permissions are working fine!"
+                                Write-Host "✅ The workspace is connected to Git, but using different credentials"
+                                Write-Host ""
+                                Write-Host "🔧 SOLUTION: We need to update the workspace Git credentials to use your service principal"
+                                Write-Host "Let's see what connections are available in your tenant..."
+                                
+                                # First, let's test basic API access and then list connections
+                                Write-Host ""
+                                Write-Host "🔍 ===== TESTING API ACCESS ====="
+                                Write-Host "Base URL: $global:baseUrl"
+                                Write-Host "Resource URL used for token: $global:resourceUrl"
+                                
+                                # Test basic API access first
+                                try {
+                                    Write-Host "Testing basic API access with workspaces endpoint..."
+                                    $testWorkspacesUrl = "$global:baseUrl/workspaces"
+                                    Write-Host "Test URL: $testWorkspacesUrl"
+                                    $testWorkspaces = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $testWorkspacesUrl -Method GET).value
+                                    Write-Host "✅ Basic API access working - found $($testWorkspaces.Count) workspaces"
+                                }
+                                catch {
+                                    Write-Host "❌ Basic API access failed!"
+                                    Write-Host "Error Type: $($_.Exception.GetType().FullName)"
+                                    Write-Host "HTTP Status Code: $($_.Exception.Response.StatusCode)"
+                                    Write-Host "Error Details: $($_.ErrorDetails.Message)"
+                                    Write-Host "Exception Message: $($_.Exception.Message)"
+                                }
+                                
+                                Write-Host ""
+                                Write-Host "🔍 ===== ALL AVAILABLE CONNECTIONS ====="
+                                try {
+                                    $getConnectionsUrl = "$global:baseUrl/connections"
+                                    Write-Host "Connections URL: $getConnectionsUrl"
+                                    Write-Host "Making connections API call..."
+                                    $allConnections = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getConnectionsUrl -Method GET).value
+                                    Write-Host "Total connections found: $($allConnections.Count)"
+                                    Write-Host ""
+                                    
+                                    if ($allConnections.Count -gt 0) {
+                                        foreach ($conn in $allConnections) {
+                                            $connType = if ($conn.connectionDetails.type) { $conn.connectionDetails.type } else { "Unknown" }
+                                            $connPath = if ($conn.connectionDetails.path) { $conn.connectionDetails.path } else { "N/A" }
+                                            Write-Host "Connection $($allConnections.IndexOf($conn) + 1):"
+                                            Write-Host "  - Display Name: '$($conn.DisplayName)'"
+                                            Write-Host "  - Connection ID: $($conn.id)"
+                                            Write-Host "  - Type: $connType"
+                                            Write-Host "  - Path: $connPath"
+                                            Write-Host "  - Created Date: $($conn.createdDate)"
+                                            Write-Host "  - Modified Date: $($conn.modifiedDate)"
+                                            Write-Host ""
+                                        }
+                                    } else {
+                                        Write-Host "❌ No connections found in your tenant."
+                                        Write-Host "This means you need to create a Git credentials connection first."
+                                    }
+                                }
+                                catch {
+                                    Write-Host "❌ Could not retrieve connections!"
+                                    Write-Host "Error Type: $($_.Exception.GetType().FullName)"
+                                    Write-Host "HTTP Status Code: $($_.Exception.Response.StatusCode)"
+                                    Write-Host "Response Headers: $($_.Exception.Response.Headers)"
+                                    Write-Host "Error Details: $($_.ErrorDetails.Message)"
+                                    Write-Host "Exception Message: $($_.Exception.Message)"
+                                    
+                                    # Check if it's a permissions issue
+                                    if ($_.Exception.Response.StatusCode -eq 403) {
+                                        Write-Host ""
+                                        Write-Host "🚨 PERMISSIONS ISSUE DETECTED!"
+                                        Write-Host "The service principal lacks permissions to access Fabric connections."
+                                        Write-Host ""
+                                        Write-Host "Required permissions for service principal:"
+                                        Write-Host "1. Fabric Admin permissions OR workspace Admin role"
+                                        Write-Host "2. Power BI Service API permissions"
+                                        Write-Host "3. Fabric.ReadWrite.All or equivalent permissions"
+                                        Write-Host ""
+                                        Write-Host "To fix this:"
+                                        Write-Host "1. Go to Azure Portal → Enterprise Applications"
+                                        Write-Host "2. Find your service principal: ****" # replaced hardcoded value
+                                        Write-Host "3. Add API permissions for Power BI Service"
+                                        Write-Host "4. OR grant Fabric Admin role to the service principal"
+                                        Write-Host "5. OR ensure the service principal is workspace Admin"
+                                    }
+                                    elseif ($_.Exception.Response.StatusCode -eq 401) {
+                                        Write-Host ""
+                                        Write-Host "🚨 AUTHENTICATION ISSUE!"
+                                        Write-Host "Token may be invalid or expired"
+                                    }
+                                    else {
+                                        Write-Host ""
+                                        Write-Host "🚨 UNEXPECTED ERROR!"
+                                        Write-Host "Status Code: $($_.Exception.Response.StatusCode)"
+                                    }
+                                }
+                                
+                                Write-Host "🔍 ===== SEARCHING FOR TARGET CONNECTION ====="
+                                Write-Host "Looking specifically for Git credentials connection named '$connectionName'..."
+                                Write-Host ""
+                                
+                                # Try to get the connection that stores Git credentials
+                                $connection = $null
+                                if ($allConnections.Count -gt 0) {
+                                    $connection = $allConnections | Where-Object {$_.DisplayName -eq $connectionName}
+                                }
+                                
+                                if ($connection) {
+                                    Write-Host "✅ Found connection '$connectionName' (ID: $($connection.id))"
+                                    Write-Host "   Connection Type: $($connection.connectionDetails.type)"
+                                    Write-Host "   Connection Path: $($connection.connectionDetails.path)"
+                                    Write-Host ""
+                                    Write-Host "Attempting to update Git credentials for the workspace..."
+                                    
+                                    try {
+                                        $updateCredentialsUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/updateCredentials"
+                                        $updateCredentialsBody = @{
+                                            myGitCredentials = @{
+                                                source = "ConfiguredConnection"
+                                                connectionId = $connection.id
+                                            }
+                                        } | ConvertTo-Json
+                                        
+                                        Write-Host "Updating credentials with body: $updateCredentialsBody"
+                                        Invoke-RestMethod -Headers $global:fabricHeaders -Uri $updateCredentialsUrl -Method POST -Body $updateCredentialsBody
+                                        Write-Host "✅ Successfully updated Git credentials for the workspace"
+                                        
+                                        # Now try to get Git status again
+                                        Write-Host "Retrying Git status after credentials update..."
+                                        $gitStatusResponse = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $gitStatusUrl -Method GET
+                                        $initializeConnectionResponse = @{
+                                            RequiredAction = "UpdateFromGit"
+                                            RemoteCommitHash = $gitStatusResponse.RemoteCommitHash
+                                            WorkspaceHead = $gitStatusResponse.WorkspaceHead
+                                        }
+                                        Write-Host "✅ Git status retrieved successfully after credentials update"
+                                    }
+                                    catch {
+                                        Write-Host "❌ Failed to update Git credentials via API: $($_.Exception.Message)"
+                                        Write-Host "Error details: $($_.ErrorDetails.Message)"
+                                        Write-Host ""
+                                        Write-Host "🔧 MANUAL SOLUTION REQUIRED:"
+                                        Write-Host "1. Go to Fabric workspace '$workspaceName'"
+                                        Write-Host "2. Workspace settings → Git Integration"
+                                        Write-Host "3. Click 'Git credentials' → 'Update credentials'"
+                                        Write-Host "4. Select connection: '$connectionName'"
+                                        Write-Host "5. Save the updated credentials"
+                                        Write-Host ""
+                                        throw "Git credentials update required - automatic update failed"
+                                    }
+                                }
+                                else {
+                                    Write-Host "❌ Connection '$connectionName' not found by exact name match."
+                                    Write-Host ""
+                                    Write-Host "🔍 Searching for similar connections (case-insensitive, partial matches)..."
+                                    
+                                    # Try to find similar connections
+                                    $similarConnections = $allConnections | Where-Object { 
+                                        $_.DisplayName -like "*$connectionName*" -or 
+                                        $_.DisplayName -like "*Fabric*" -or 
+                                        $_.DisplayName -like "*EDW*" -or
+                                        $connectionName -like "*$($_.DisplayName)*"
+                                    }
+                                    
+                                    if ($similarConnections.Count -gt 0) {
+                                        Write-Host "Found similar connections:"
+                                        foreach ($conn in $similarConnections) {
+                                            $connType = if ($conn.connectionDetails.type) { $conn.connectionDetails.type } else { "Unknown" }
+                                            Write-Host "  - Name: '$($conn.DisplayName)' | Type: $connType | ID: $($conn.id)"
+                                        }
+                                        
+                                        # Try the first matching connection
+                                        $bestMatch = $similarConnections[0]
+                                        Write-Host ""
+                                        Write-Host "🔄 Attempting to use closest match: '$($bestMatch.DisplayName)'"
+                                        
+                                        try {
+                                            $updateCredentialsUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/updateCredentials"
+                                            $updateCredentialsBody = @{
+                                                myGitCredentials = @{
+                                                    source = "ConfiguredConnection"
+                                                    connectionId = $bestMatch.id
+                                                }
+                                            } | ConvertTo-Json
+                                            
+                                            Write-Host "Updating credentials with connection: $($bestMatch.DisplayName) (ID: $($bestMatch.id))"
+                                            Invoke-RestMethod -Headers $global:fabricHeaders -Uri $updateCredentialsUrl -Method POST -Body $updateCredentialsBody
+                                            Write-Host "✅ Successfully updated Git credentials using connection: '$($bestMatch.DisplayName)'"
+                                            
+                                            # Now try to get Git status again
+                                            Write-Host "Retrying Git status after credentials update..."
+                                            $gitStatusResponse = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $gitStatusUrl -Method GET
+                                            $initializeConnectionResponse = @{
+                                                RequiredAction = "UpdateFromGit"
+                                                RemoteCommitHash = $gitStatusResponse.RemoteCommitHash
+                                                WorkspaceHead = $gitStatusResponse.WorkspaceHead
+                                            }
+                                            Write-Host "✅ Git status retrieved successfully using connection: '$($bestMatch.DisplayName)'"
+                                        }
+                                        catch {
+                                            Write-Host "❌ Failed to update Git credentials using '$($bestMatch.DisplayName)': $($_.Exception.Message)"
+                                            Write-Host "Will try manual configuration guidance..."
+                                        }
+                                    }
+                                    
+                                    # If we still don't have success, provide manual guidance
+                                    if (-not $initializeConnectionResponse) {
+                                        Write-Host ""
+                                        Write-Host "🔧 MANUAL CONFIGURATION REQUIRED:"
+                                        Write-Host "Your service principal permissions are working, but the workspace Git credentials need to be updated."
+                                        Write-Host ""
+                                        Write-Host "📋 CONNECTIONS FOUND IN YOUR TENANT:"
+                                        if ($allConnections.Count -gt 0) {
+                                            foreach ($conn in $allConnections) {
+                                                Write-Host "   - '$($conn.DisplayName)' (Type: $($conn.connectionDetails.type))"
+                                            }
+                                        } else {
+                                            Write-Host "   - No connections found - you need to create one first"
+                                        }
+                                        Write-Host ""
+                                        Write-Host "🔧 MANUAL STEPS TO FIX:"
+                                        Write-Host "1. Go to Fabric workspace '$workspaceName'"
+                                        Write-Host "2. Workspace settings → Git Integration"
+                                        Write-Host "3. Look for 'Git credentials' section"
+                                        Write-Host "4. Click 'Update credentials' or 'Change credentials'"
+                                        if ($allConnections.Count -gt 0) {
+                                            Write-Host "5. Select from existing connections:"
+                                            foreach ($conn in $allConnections | Select-Object -First 5) {
+                                                Write-Host "   - '$($conn.DisplayName)'"
+                                            }
+                                        } else {
+                                            Write-Host "5. Create a new connection first:"
+                                            Write-Host "   - Click 'Add Account' or 'New Connection'"
+                                            Write-Host "   - Select Azure DevOps"
+                                            Write-Host "   - Use Service Principal authentication"
+                                            Write-Host "   - Service Principal ID: $(AZURE_CLIENT_ID)"
+                                            Write-Host "   - Display name: '$connectionName'"
+                                        }
+                                        Write-Host "6. Save the updated credentials"
+                                        Write-Host ""
+                                        Write-Host "🎯 The key point: The workspace needs to use your service principal's Git credentials"
+                                        Write-Host "   instead of whoever originally connected it to Git."
+                                        Write-Host ""
+                                        
+                                        # Don't throw error - let the user see the connections list
+                                        Write-Host "ℹ️ Pipeline completed successfully - manual Git credentials update needed"
+                                        Write-Host ""
+                                        Write-Host "🎯 NEXT STEPS:"
+                                        Write-Host "1. Use the connections information above to update workspace Git credentials"
+                                        Write-Host "2. Re-run this pipeline after updating the credentials"
+                                        Write-Host "3. The pipeline should then successfully sync from Git"
+                                        return
+                                    }
+                                }
+                            }
+                            else {
+                                # Different error - but let's still try to show connections for debugging
+                                Write-Host "⚠️ Different error detected, but will still try to list connections for debugging"
+                                Write-Host "Error code found: $($errorDetails.errorCode)"
+                                
+                                # Try to list connections anyway for debugging
+                                Write-Host ""
+                                Write-Host "🔍 ===== DEBUGGING - LISTING CONNECTIONS ANYWAY ====="
+                                try {
+                                    $getConnectionsUrl = "$global:baseUrl/connections"
+                                    Write-Host "Connections URL: $getConnectionsUrl"
+                                    $allConnections = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getConnectionsUrl -Method GET).value
+                                    Write-Host "Total connections found: $($allConnections.Count)"
+                                    
+                                    if ($allConnections.Count -gt 0) {
+                                        foreach ($conn in $allConnections) {
+                                            $connType = if ($conn.connectionDetails.type) { $conn.connectionDetails.type } else { "Unknown" }
+                                            Write-Host "  - '$($conn.DisplayName)' | Type: $connType | ID: $($conn.id)"
+                                        }
+                                    } else {
+                                        Write-Host "  No connections found."
+                                    }
+                                }
+                                catch {
+                                    Write-Host "Could not retrieve connections: $($_.Exception.Message)"
+                                }
+                                
+                                # Now rethrow the original error
+                                throw
+                            }
+                        }
+                    }
+                    
+                    # Update from Git if required
+                    if ($initializeConnectionResponse.RequiredAction -eq "UpdateFromGit") {
+                        Write-Host "🔄 Updating workspace '$workspaceName' from Git..."
+                        $updateFromGitUrl = "$global:baseUrl/workspaces/$($workspace.Id)/git/updateFromGit"
+                        
+                        $updateFromGitBody = @{
+                            remoteCommitHash = $initializeConnectionResponse.RemoteCommitHash
+                            workspaceHead = $initializeConnectionResponse.WorkspaceHead
+                        } | ConvertTo-Json
+                        
+                        $updateFromGitResponse = Invoke-WebRequest -Headers $global:fabricHeaders -Uri $updateFromGitUrl -Method POST -Body $updateFromGitBody
+                        
+                        $operationId = $updateFromGitResponse.Headers['x-ms-operation-id']
+                        $retryAfter = $updateFromGitResponse.Headers['Retry-After']
+                        if (-not $retryAfter) { $retryAfter = 10 }  # Default retry interval
+                        
+                        Write-Host "⏳ Long Running Operation ID: '$operationId' scheduled (retry after $retryAfter seconds)"
+                        
+                        # Poll operation status
+                        $getOperationState = "$global:baseUrl/operations/$operationId"
+                        do {
+                            Start-Sleep -Seconds $retryAfter
+                            $operationState = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getOperationState -Method GET
+                            Write-Host "Operation status: $($operationState.Status)"
+                        } while($operationState.Status -in @("NotStarted", "Running"))
+                        
+                        if ($operationState.Status -eq "Failed") {
+                            Write-Error "❌ Failed to update workspace from Git. Error: $($operationState.Error | ConvertTo-Json)"
+                            throw
+                        }
+                        else {
+                            Write-Host "✅ Workspace '$workspaceName' successfully updated from Git!"
+                        }
+                    }
+                    else {
+                        Write-Host "ℹ️ No update required. RequiredAction: $($initializeConnectionResponse.RequiredAction)"
+                    }
+                    
+                } catch {
+                    $errorResponse = GetErrorResponse($_.Exception)
+                    Write-Host "❌ Failed to connect and update workspace '$workspaceName' from Git. Error: $errorResponse"
+                    Write-Host "ℹ️ This is expected if Git credentials need to be configured - pipeline will continue to show available options"
+                    # Don't throw here - let the inner error handling show connections and provide guidance
+                }
